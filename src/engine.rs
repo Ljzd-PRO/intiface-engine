@@ -1,19 +1,15 @@
 use crate::{
-  backdoor_server::BackdoorServer,
-  buttplug_server::{run_server, setup_buttplug_server},
-  error::IntifaceEngineError,
-  frontend::{
+  backdoor_server::BackdoorServer, buttplug_server::{run_server, setup_buttplug_server}, error::IntifaceEngineError, frontend::{
     frontend_external_event_loop, frontend_server_event_loop, process_messages::EngineMessage,
     Frontend,
-  },
-  mdns::IntifaceMdns,
-  options::EngineOptions,
-  ButtplugRepeater,
+  }, mdns::IntifaceMdns, options::EngineOptions, remote_server::ButtplugRemoteServerEvent, ButtplugRepeater
 };
 
+use buttplug::{server::device::configuration::DeviceConfigurationManager, util::device_configuration::save_user_config};
+use futures::{pin_mut, StreamExt};
 use once_cell::sync::OnceCell;
-use std::{sync::Arc, time::Duration};
-use tokio::select;
+use std::{path::Path, sync::Arc, time::Duration};
+use tokio::{fs, select};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(debug_assertions)]
@@ -49,6 +45,7 @@ impl IntifaceEngine {
     &self,
     options: &EngineOptions,
     frontend: Option<Arc<dyn Frontend>>,
+    dcm: &Option<Arc<DeviceConfigurationManager>>,
   ) -> Result<(), IntifaceEngineError> {
     // Set up Frontend
     if let Some(frontend) = &frontend {
@@ -102,8 +99,29 @@ impl IntifaceEngine {
 
     // Hang out until those listeners get sick of listening.
     info!("Intiface CLI Setup finished, running server tasks until all joined.");
-    let server = setup_buttplug_server(options, &self.backdoor_server).await?;
-
+    let server = setup_buttplug_server(options, &self.backdoor_server, &dcm).await?;
+    let dcm = server.server().device_manager().device_configuration_manager().clone();
+    if let Some(config_path) = options.user_device_config_path() {
+      let stream = server.event_stream();
+      {
+        let config_path = config_path.to_owned();
+        tokio::spawn(async move {
+          pin_mut!(stream);
+          loop {
+            if let Some(event) = stream.next().await {
+              match event {
+                ButtplugRemoteServerEvent::DeviceAdded { index, identifier, name, display_name } => {
+                  if let Ok(config_str) = save_user_config(&dcm) {
+                    fs::write(&Path::new(&config_path), config_str).await;
+                  }
+                }
+                _ => continue,
+              }
+            };
+          }
+        });
+      }
+    }
     if let Some(frontend) = &frontend {
       frontend.send(EngineMessage::EngineServerCreated {}).await;
       let event_receiver = server.event_stream();
